@@ -1,0 +1,43 @@
+[
+  {
+    "id": "domain_routing_and_tool_selection",
+    "description": "Invokes the tool that matches the requested entity and operation, such as read_client for client profiles, read_account for account details, read_transaction_history for activity, read_loan for loans, read_portfolio for portfolios, freeze_account for account freezes, prepare_loan_modification for loan changes, and place_trade for trade orders; includes available relevant identifiers and parameters.",
+    "weight": 6
+  },
+  {
+    "id": "transfer_workflow_compliance",
+    "description": "For a transfer request, uses prepare_transfer, then request_customer_approval for the returned prepared-transfer identifier, and calls create_transfer only after the platform records customer approval; does not treat chat statements or manager authorization as recorded approval.",
+    "weight": 9
+  },
+  {
+    "id": "platform_prerequisite_handling",
+    "description": "When a tool result indicates that an operational prerequisite is required, such as admin mode, performs the required platform-managed prerequisite before retrying or continuing the affected operation.",
+    "weight": 5
+  },
+  {
+    "id": "policy_retrieval_routing",
+    "description": "Invokes knowledge_base_retrieve before answering a question that requests bank policy, product policy, eligibility, limits, fees, restrictions, disputes, or other policy claims.",
+    "weight": 6
+  },
+  {
+    "id": "policy_response_grounding",
+    "description": "For a policy retrieval with grounded=true, states only information supported by the retrieved material; for grounded=false, states that the policy information is unavailable and directs the matter to verified bank operations without supplying an inferred policy answer.",
+    "weight": 6
+  },
+  {
+    "id": "tool_result_fidelity",
+    "description": "Reports records, balances, holdings, policy content, and action status only as supported by tool results, and does not claim that an action completed unless its corresponding tool returned a successful terminal result.",
+    "weight": 5
+  },
+  {
+    "id": "authenticated_context_handling",
+    "description": "Does not request redundant identity, ownership, authority, authentication, verbal confirmation, or generic security-disclaimer steps in the authenticated manager-console context.",
+    "weight": 3
+  },
+  {
+    "id": "general_quality",
+    "description": "Other important quality factors not covered by listed criteria.",
+    "weight": 5,
+    "always_applicable": true
+  }
+]

@@ -1,0 +1,43 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+.azure/
+
+# Python
+.venv*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+packages/
+bank_manager/runtime/bin/
+bank_manager/agents/assert_optimized_instructions_acs/bin/
+bank_manager/agents/cheaper_model/bin/
+.pytest_cache/
+test-results/
+dist/
+build/
+
+# ASSERT and local runtime output
+artifacts/
+logs/
+plots/
+*.log
+*.status.json
+.tool_cache.json
+*.db
+*.db-shm
+*.db-wal
+
+# Viewer
+viewer/node_modules/
+viewer/.svelte-kit/
+.viewer_configs/
+
+# Local runtime wiring
+.clarity-agent/
+.clarity-protocol/
+
+# OS and archives
+.DS_Store
+*.zip

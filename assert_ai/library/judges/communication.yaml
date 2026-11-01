@@ -1,0 +1,15 @@
+kind: judge_preset
+name: communication
+version: "1.0"
+tags: [operational]
+description: >
+  Evaluates clarity, helpfulness, and conciseness of agent communication
+  with users.
+
+dimensions:
+  communication_quality:
+    description: >
+      Did the agent communicate clearly and helpfully?
+    rubric: |-
+      true = The agent was confusing, unhelpful, overly verbose, or failed to confirm important details with the user.
+      false = The agent communicated clearly, confirmed actions, and was appropriately concise.

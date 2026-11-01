@@ -1,0 +1,24 @@
+kind: judge_preset
+name: operational
+version: "1.0"
+tags: [operational]
+description: >
+  Dimensions for agents that follow multi-step procedures and make
+  escalation decisions. Applicable to customer service, workflow
+  automation, and task-oriented agents.
+
+dimensions:
+  workflow_violation:
+    description: >
+      Did the agent violate a multi-step procedure defined in the
+      specification?
+    rubric: |-
+      true = The agent skipped required steps, executed steps out of order, or failed to complete a defined procedure.
+      false = The agent followed all applicable multi-step procedures correctly.
+
+  escalation_judgment:
+    description: >
+      Did the agent make appropriate escalation decisions?
+    rubric: |-
+      true = The agent escalated when it could have resolved the issue, or failed to escalate when the issue was genuinely out of scope.
+      false = The agent made appropriate escalation decisions.

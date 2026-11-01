@@ -1,0 +1,14 @@
+name: bank-manager-fixed
+agent:
+    name: bank-manager-agent
+    kind: hosted
+    version: "12"
+dataset:
+    local_uri: bank_manager/evals/foundry_local_eval_v0004.jsonl
+evaluators:
+    - name: bank-manager-fixed
+      version: "1"
+      local_uri: evaluators\bank-manager-fixed\rubric_dimensions.json
+options:
+    eval_model: gpt-5.6-terra
+max_samples: 19

@@ -1,0 +1,6 @@
+format_version: "0.1"
+name: bank_manager_feature
+policy:
+  type: rego
+  bundle: policy
+  entrypoint: agent_control_specification/bank_manager_feature/verdict

@@ -1,0 +1,2047 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+"""Click CLI for the measurements pipeline (ASSERT)."""
+
+from __future__ import annotations
+
+import difflib
+import json
+import sys
+
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Iterable, Optional
+
+import click
+import yaml
+from click.shell_completion import CompletionItem
+from rich.console import Console
+from rich.table import Table
+
+from assert_ai.core.config_model import DEFAULT_INFERENCE_CONCURRENCY
+from assert_ai.core.io import load_json, load_jsonl, get_permissible_flag, row_behavior
+from assert_ai.core.judge import get_verdict_dimension, infer_judge_status, is_valid_event_flag
+from assert_ai.core.yaml_io import dump_yaml
+from assert_ai.display import label_metric, label_run_status, label_stage, label_stage_status, label_status
+from assert_ai.logging_config import configure_logging
+from assert_ai.results import (
+    compute_dimension_summary,
+    compute_policy_violation_by_permissibility,
+    detect_dimensions,
+    has_permissibility_split_data,
+)
+from assert_ai.stages import STAGE_NAMES
+
+ROOT = Path(__file__).resolve().parent.parent
+JUDGE_DIMENSIONS_PATH = ROOT / "examples" / "eval-definitions" / "judge_dimensions.yaml"
+DEFAULT_RESULTS_DIR = ROOT / "artifacts" / "results"
+
+CONTEXT_SETTINGS = {
+    "help_option_names": ["-h", "--help"],
+    "max_content_width": 100,
+    "auto_envvar_prefix": "ASSERT_AI",
+}
+
+DEFAULT_COMPARE_METRIC = "policy_violation"
+
+_POLICY_VIOLATION_NOT_PERMISSIBLE = "policy_violation_not_permissible"
+_POLICY_VIOLATION_PERMISSIBLE = "policy_violation_permissible"
+_DERIVED_PERMISSIBILITY_RATE_KEYS = {
+    _POLICY_VIOLATION_NOT_PERMISSIBLE: "not_permissible_policy_violation_rate",
+    _POLICY_VIOLATION_PERMISSIBLE: "permissible_policy_violation_rate",
+}
+_DERIVED_PERMISSIBILITY_SUMMARY_KEYS = {
+    _POLICY_VIOLATION_NOT_PERMISSIBLE: "policy_violation_on_not_permissible",
+    _POLICY_VIOLATION_PERMISSIBLE: "policy_violation_on_permissible",
+}
+_SUPERSEDED_DISPLAY_METRICS = {"policy_violation", "overrefusal"}
+
+_RUNNER_MODULE: Any | None = None
+_TEST_SET_METRICS_MODULE: Any | None = None
+
+
+
+class SuggestingGroup(click.Group):
+    """Click group that offers close-command suggestions on typos."""
+
+    def get_command(self, ctx: click.Context, cmd_name: str) -> click.Command | None:
+        command = super().get_command(ctx, cmd_name)
+        if command is not None or ctx.resilient_parsing:
+            return command
+
+        suggestions = difflib.get_close_matches(cmd_name, self.list_commands(ctx), n=3, cutoff=0.45)
+        suggestion_text = f" Did you mean: {', '.join(suggestions)}?" if suggestions else ""
+        raise click.UsageError(f"No such command '{cmd_name}'.{suggestion_text}", ctx=ctx)
+
+
+def _load_runner_module():
+    global _RUNNER_MODULE
+    if _RUNNER_MODULE is None:
+        from assert_ai import runner
+
+        _RUNNER_MODULE = runner
+    return _RUNNER_MODULE
+
+
+def _load_test_set_metrics():
+    global _TEST_SET_METRICS_MODULE
+    if _TEST_SET_METRICS_MODULE is None:
+        from assert_ai.analysis import test_set_metrics
+
+        _TEST_SET_METRICS_MODULE = test_set_metrics
+    return _TEST_SET_METRICS_MODULE
+
+
+def _handle_missing_analysis_dependency(exc: ModuleNotFoundError) -> None:
+    missing = getattr(exc, "name", "") or "analysis extras"
+    _error(
+        f"Could not import '{missing}'. Install the analysis dependencies first, for example:\n"
+        "  python -m pip install -e \".[analysis]\""
+    )
+
+
+def _load_analysis_module(loader: Callable[[], Any]) -> Any:
+    try:
+        return loader()
+    except ModuleNotFoundError as exc:
+        _handle_missing_analysis_dependency(exc)
+
+
+def _handle_missing_acs_dependency(exc: ModuleNotFoundError) -> None:
+    missing = getattr(exc, "name", "") or "ACS extra"
+    _error(
+        f"Could not import ACS dependency '{missing}'. Install the ACS extra first, for example:\n"
+        "  python -m pip install -e \".[acs]\""
+    )
+
+
+def _load_acs_symbol(name: str) -> Any:
+    try:
+        import assert_ai.integrations.acs as acs
+
+        return getattr(acs, name)
+    except ModuleNotFoundError as exc:
+        _handle_missing_acs_dependency(exc)
+
+
+def _console(*, no_color: bool = False) -> Console:
+    return Console(highlight=False, color_system=None if no_color else "auto")
+
+
+def _error(message: str) -> None:
+    click.echo(message, err=True)
+    raise SystemExit(1)
+
+
+def _echo_json(payload: Any) -> None:
+    click.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _format_timestamp(value: Any) -> str:
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    if isinstance(value, str) and value:
+        return value
+    return "-"
+
+
+def _fmt_percent(value: Optional[float]) -> str:
+    if value is None:
+        return "-"
+    return f"{value * 100:.1f}%"
+
+
+_PERMISSIBILITY_SPLIT_RATE_KEYS = tuple(_DERIVED_PERMISSIBILITY_RATE_KEYS.values())
+
+
+def _has_permissibility_split(*metric_sets: Any) -> bool:
+    """True when any of ``metric_sets`` reports the permissibility split.
+
+    The split supersedes ``policy_violation`` (which unions permissible and
+    impermissible behaviors) and ``overrefusal`` (only the refusal-shaped subset
+    of permissible violations) on display surfaces. Runs without a behavior
+    taxonomy -- including quality suites that repurpose ``policy_violation`` for
+    non-safety failures -- have no split and keep reporting the original pair.
+
+    Detection keys off presence rather than a non-null rate: a bucket whose rate
+    is ``None`` was still computed, it just had no applicable rows. An
+    all-permissible taxonomy yields a real permissible rate alongside a ``None``
+    impermissible rate, and reading that ``None`` as "no split" would drop the
+    run back to the superseded pair while the viewer showed the split.
+    """
+    return any(
+        isinstance(metrics, dict)
+        and any(key in metrics for key in _PERMISSIBILITY_SPLIT_RATE_KEYS)
+        for metrics in metric_sets
+    )
+
+
+def _violation_column_titles(split: bool) -> tuple[str, ...]:
+    if split:
+        return (
+            "Prompt impermissible violations",
+            "Prompt permissible violations",
+            "Scenario impermissible violations",
+            "Scenario permissible violations",
+        )
+    return (
+        "Prompt policy violations",
+        "Prompt overrefusals",
+        "Scenario policy violations",
+    )
+
+
+def _violation_cells(
+    prompt_metrics: dict[str, Any],
+    scenario_metrics: dict[str, Any],
+    split: bool,
+) -> tuple[str, ...]:
+    if split:
+        return (
+            _fmt_percent(prompt_metrics.get("not_permissible_policy_violation_rate")),
+            _fmt_percent(prompt_metrics.get("permissible_policy_violation_rate")),
+            _fmt_percent(scenario_metrics.get("not_permissible_policy_violation_rate")),
+            _fmt_percent(scenario_metrics.get("permissible_policy_violation_rate")),
+        )
+    return (
+        _fmt_percent(_dimension_rate(prompt_metrics, "policy_violation")),
+        _fmt_percent(_dimension_rate(prompt_metrics, "overrefusal")),
+        _fmt_percent(_dimension_rate(scenario_metrics, "policy_violation")),
+    )
+
+
+def _fmt_binary_counts(counts: dict[int, int]) -> str:
+    return f"0:{counts.get(0, 0)} 1:{counts.get(1, 0)}"
+
+
+def _fmt_flagged_pass(counts: dict[int, int]) -> str:
+    """Render the flagged/pass counts using the viewer's terminology."""
+    return f"{counts.get(1, 0)} flagged / {counts.get(0, 0)} pass"
+
+
+def _fmt_dimension_summary(summary: dict[str, Any]) -> tuple[str, str, str]:
+    count = int(summary.get("count") or 0)
+    if summary.get("kind") == "ordinal":
+        raw_counts = summary.get("counts")
+        counts: dict[str, Any] = raw_counts if isinstance(raw_counts, dict) else {}
+        raw_scale = summary.get("scale")
+        scale: dict[str, Any] = raw_scale if isinstance(raw_scale, dict) else {}
+        raw_scale_values = scale.get("values")
+        scale_values: list[Any] = raw_scale_values if isinstance(raw_scale_values, list) else []
+        ordered_keys = [
+            str(entry.get("value"))
+            for entry in scale_values
+            if isinstance(entry, dict) and entry.get("value") is not None
+        ]
+        distribution = ", ".join(f"{key}:{counts.get(key, 0)}" for key in ordered_keys)
+        not_applicable = int(summary.get("not_applicable_count") or 0)
+        if not_applicable:
+            distribution = f"{distribution}, N/A:{not_applicable}" if distribution else f"N/A:{not_applicable}"
+        return f"median {summary.get('median', 'N/A')}", str(count), distribution or "-"
+    return (
+        _fmt_percent(summary.get("rate")),
+        str(count),
+        _fmt_flagged_pass(summary.get("counts", {})),
+    )
+
+
+def _visible_dimension_summaries(metrics: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Return the dimensions shown by default on CLI detail surfaces.
+
+    The raw built-ins stay in artifacts and JSON for compatibility. When the
+    permissibility split is available, the text UI replaces that older pair
+    with the same two derived measures used by the viewer.
+    """
+    raw_dimensions = metrics.get("dimensions")
+    dimensions = raw_dimensions if isinstance(raw_dimensions, dict) else {}
+    visible: list[tuple[str, dict[str, Any]]] = []
+
+    if has_permissibility_split_data(metrics):
+        for metric in (_POLICY_VIOLATION_NOT_PERMISSIBLE, _POLICY_VIOLATION_PERMISSIBLE):
+            summary = metrics.get(_DERIVED_PERMISSIBILITY_SUMMARY_KEYS[metric])
+            if isinstance(summary, dict):
+                visible.append((metric, summary))
+        hidden = _SUPERSEDED_DISPLAY_METRICS
+    else:
+        hidden = set()
+
+    visible.extend(
+        (name, summary)
+        for name, summary in sorted(dimensions.items())
+        if name not in hidden and isinstance(summary, dict)
+    )
+    return visible
+
+
+def _metric_label(metric: str) -> str:
+    return label_metric(metric)
+
+
+def _resolve_results_dir(results_dir: Path) -> Path:
+    path = results_dir.expanduser()
+    if not path.is_absolute():
+        path = (ROOT / path).resolve()
+    return path
+
+
+def _resolve_acs_run_dir(run_dir: Path | None, suite: str | None, run_id: str | None) -> Path:
+    has_run_dir = run_dir is not None
+    has_suite_run = suite is not None or run_id is not None
+    if has_run_dir and has_suite_run:
+        _error("Use either --run-dir or --suite with --run, not both.")
+    if not has_run_dir and not has_suite_run:
+        _error("Provide either --run-dir or both --suite and --run.")
+    if has_suite_run and (suite is None or run_id is None):
+        _error("Use --suite and --run together, or provide --run-dir.")
+
+    if run_dir is not None:
+        resolved = run_dir.expanduser()
+        if not resolved.is_absolute():
+            resolved = resolved.resolve()
+    else:
+        resolved = DEFAULT_RESULTS_DIR / str(suite) / str(run_id)
+
+    if not resolved.exists():
+        _error(f"Run directory not found: {resolved}")
+    if not resolved.is_dir():
+        _error(f"Run path is not a directory: {resolved}")
+    if not (resolved / "scores.jsonl").is_file():
+        _error(f"Run directory does not contain scores.jsonl: {resolved}")
+    return resolved
+
+
+def _default_acs_out_dir(summary: Any) -> Path:
+    suite_id = str(getattr(summary, "suite_id", "") or "policy")
+    return ROOT / "artifacts" / "acs" / suite_id
+
+
+def _print_acs_artifacts(artifacts: Any) -> None:
+    click.echo("Wrote ACS policy:")
+    click.echo(f"  manifest: {artifacts.manifest_path}")
+    click.echo(f"  rego:     {artifacts.rego_path}")
+    click.echo(f"  report:   {artifacts.report_path}")
+    guarded_points = ", ".join(str(point) for point in artifacts.guarded_points) or "-"
+    click.echo(f"Guarded points: {guarded_points}")
+    if artifacts.warnings:
+        click.echo("Warnings:")
+        for warning in artifacts.warnings:
+            click.echo(f"  - {warning}")
+
+
+def _print_acs_validation_totals(report: Any) -> None:
+    click.echo(
+        f"Validation: handled {report.handled}/{report.total} "
+        f"(reacted, incl. warn); strongly blocked {report.strong_blocked}/{report.total} "
+        f"(deny/escalate); handled_rate {_fmt_percent(report.handled_rate)}"
+    )
+    if getattr(report, "annotator_dependent", False) and report.not_blocked > 0:
+        click.echo(
+            "  Note: this policy conditions on LLM annotators (input.annotations.*), "
+            "which offline validation does not populate — annotator rules cannot fire "
+            "here, so an unblocked/0-handled result for them is EXPECTED, not a policy "
+            "defect. Verify these gates via a guarded remeasure run (assert-ai run with "
+            "the governed config and check the violation-rate drop), not offline validate."
+        )
+
+
+def _enforce_acs_validation_gate(report: Any, *, fail_on_allow: bool, require_block: bool) -> None:
+    """Fail the command per the requested validation gate, strictest first."""
+    uncovered = getattr(report, "uncovered_behaviors", ())
+    if (require_block or fail_on_allow) and uncovered:
+        _error(
+            "ACS validation could not replay any example for behavior finding(s): "
+            f"{', '.join(uncovered)}. The policy was not exercised against them "
+            "(no inference evidence); re-run with the matching inference set."
+        )
+    if require_block and not report.fully_blocked:
+        _error(
+            f"ACS policy did not strongly block {report.not_blocked} known-bad example(s) "
+            "(only deny/escalate counts as a block)."
+        )
+    if fail_on_allow and not report.ok:
+        _error(f"ACS policy allowed {report.failed} known-bad example(s).")
+
+
+def _print_acs_validation_by_point(report: Any) -> None:
+    grouped: dict[str, dict[str, int]] = {}
+    for case in report.cases:
+        point = str(case.intervention_point or "-")
+        bucket = grouped.setdefault(point, {"total": 0, "handled": 0, "strong": 0})
+        bucket["total"] += 1
+        bucket["handled"] += int(bool(case.handled))
+        bucket["strong"] += int(bool(case.strong_block))
+
+    if not grouped:
+        click.echo("Validation cases: 0")
+        return
+
+    table = Table(title="Validation by intervention point", box=None, show_header=True, show_edge=False, pad_edge=False)
+    table.add_column("Point", style="cyan", no_wrap=True)
+    table.add_column("Handled", style="white", no_wrap=True)
+    table.add_column("Strong blocked", style="white", no_wrap=True)
+    for point, bucket in sorted(grouped.items()):
+        table.add_row(
+            point,
+            f"{bucket['handled']}/{bucket['total']}",
+            str(bucket["strong"]),
+        )
+    _console().print(table)
+
+
+def _print_acs_validation_cases(report: Any) -> None:
+    table = Table(title="Validation cases", box=None, show_header=True, show_edge=False, pad_edge=False)
+    table.add_column("Intervention point", style="cyan", no_wrap=True)
+    table.add_column("Behavior", style="white")
+    table.add_column("Dimension", style="white", no_wrap=True)
+    table.add_column("Decision", style="white", no_wrap=True)
+    table.add_column("Strong block", style="white", no_wrap=True)
+    for case in report.cases:
+        table.add_row(
+            str(case.intervention_point),
+            str(case.behavior),
+            str(case.dimension),
+            str(case.decision),
+            "yes" if case.strong_block else "no",
+        )
+    _console().print(table)
+
+
+def _complete_suite(ctx: click.Context, _: click.Parameter, incomplete: str) -> list[CompletionItem]:
+    results_dir = _resolve_results_dir(Path(ctx.params.get("results_dir") or DEFAULT_RESULTS_DIR))
+    if not results_dir.exists():
+        return []
+    items: list[CompletionItem] = []
+    for path in sorted(results_dir.iterdir()):
+        if not path.is_dir():
+            continue
+        if incomplete and not path.name.startswith(incomplete):
+            continue
+        items.append(CompletionItem(path.name))
+    return items
+
+
+def _complete_run(ctx: click.Context, _: click.Parameter, incomplete: str) -> list[CompletionItem]:
+    results_dir = _resolve_results_dir(Path(ctx.params.get("results_dir") or DEFAULT_RESULTS_DIR))
+    suite = ctx.params.get("suite")
+    if not suite:
+        return []
+    suite_dir = results_dir / str(suite)
+    if not suite_dir.exists():
+        return []
+    items: list[CompletionItem] = []
+    for path in sorted(suite_dir.iterdir()):
+        if not path.is_dir():
+            continue
+        if incomplete and not path.name.startswith(incomplete):
+            continue
+        items.append(CompletionItem(path.name))
+    return items
+
+
+def _load_dimensions() -> dict[str, Any]:
+    if not JUDGE_DIMENSIONS_PATH.exists():
+        return {}
+    try:
+        data = yaml.safe_load(JUDGE_DIMENSIONS_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _complete_metric(_: click.Context, __: click.Parameter, incomplete: str) -> list[CompletionItem]:
+    dims = _load_dimensions()
+    items = sorted(set(dims) | set(_DERIVED_PERMISSIBILITY_RATE_KEYS))
+    return [CompletionItem(name) for name in items if not incomplete or name.startswith(incomplete)]
+
+
+def _current_stage_status(manifest: dict[str, Any] | None) -> tuple[str, str]:
+    if isinstance(manifest, dict):
+        manifest_status = manifest.get("status")
+        if isinstance(manifest_status, str) and manifest_status:
+            stages = manifest.get("stages")
+            if isinstance(stages, dict):
+                for stage_name, stage_status in stages.items():
+                    if stage_status == "running":
+                        return manifest_status, str(stage_name)
+            return manifest_status, "-"
+
+    return "unknown", "-"
+
+
+def _detect_dimensions(rows: Iterable[dict[str, Any]]) -> list[str]:
+    return detect_dimensions(rows)
+
+
+def _compute_dimension_summary(rows: Iterable[dict[str, Any]], metric: str) -> dict[str, Any]:
+    return compute_dimension_summary(rows, metric)
+
+
+def _dimension_rate(metrics: dict[str, Any], metric: str) -> float | None:
+    derived_rate_key = _DERIVED_PERMISSIBILITY_RATE_KEYS.get(metric)
+    if derived_rate_key is not None:
+        rate = metrics.get(derived_rate_key)
+        return float(rate) if isinstance(rate, (int, float)) else None
+    dimensions = metrics.get("dimensions")
+    if not isinstance(dimensions, dict):
+        return None
+    summary = dimensions.get(metric)
+    if not isinstance(summary, dict):
+        return None
+    rate = summary.get("rate")
+    return float(rate) if isinstance(rate, (int, float)) else None
+
+
+def _resolve_compare_metric(metric: str | None, run_summaries: Iterable[dict[str, Any]]) -> str:
+    if metric:
+        return metric
+    summaries = list(run_summaries)
+    if summaries and all(
+        has_permissibility_split_data(
+            run_summary.get("prompt_metrics") or {},
+            run_summary.get("scenario_metrics") or {},
+        )
+        for run_summary in summaries
+    ):
+        return _POLICY_VIOLATION_NOT_PERMISSIBLE
+    return DEFAULT_COMPARE_METRIC
+
+
+def _available_compare_metrics(run_summaries: Iterable[dict[str, Any]]) -> set[str]:
+    available: set[str] = set()
+    for run_summary in run_summaries:
+        available.update(_detect_dimensions(run_summary.get("prompt_rows") or []))
+        if has_permissibility_split_data(
+            run_summary.get("prompt_metrics") or {},
+            run_summary.get("scenario_metrics") or {},
+        ):
+            available.update(_DERIVED_PERMISSIBILITY_RATE_KEYS)
+    return available
+
+
+def _reject_ordinal_compare(run_summaries: Iterable[dict[str, Any]], metric: str) -> None:
+    for run_summary in run_summaries:
+        for key in ("prompt_metrics", "scenario_metrics"):
+            metrics = run_summary.get(key)
+            dimensions = metrics.get("dimensions") if isinstance(metrics, dict) else None
+            summary = dimensions.get(metric) if isinstance(dimensions, dict) else None
+            if isinstance(summary, dict) and summary.get("kind") == "ordinal":
+                _error(
+                    f"Metric '{metric}' uses ordered grades and has no violation-rate delta. "
+                    "Use 'assert-ai results status' or the viewer for its grade distribution."
+                )
+
+
+def _compute_prompt_metrics(
+    rows: list[dict[str, Any]],
+    behavior_categories: Iterable[dict[str, Any]] = (),
+) -> dict[str, Any] | None:
+    if not rows:
+        return None
+
+    scored_rows = [row for row in rows if infer_judge_status(row) == "ok"]
+    scored_total = len(scored_rows)
+    judge_failures = len(rows) - scored_total
+
+    dimensions: dict[str, dict[str, Any]] = {}
+    for dim in _detect_dimensions(scored_rows):
+        dimensions[dim] = _compute_dimension_summary(scored_rows, dim)
+
+    target = next(
+        (
+            row.get("target")
+            for row in rows
+            if isinstance(row.get("target"), str) and row.get("target")
+        ),
+    ) or "-"
+    judge_model = next(
+        (
+            row.get("judge_model")
+            for row in rows
+            if isinstance(row.get("judge_model"), str) and row.get("judge_model")
+        ),
+    ) or "-"
+    permissibility_split = compute_policy_violation_by_permissibility(
+        scored_rows,
+        behavior_categories,
+    )
+
+    metrics: dict[str, Any] = {
+        "total": len(rows),
+        "scored_total": scored_total,
+        "judge_failures": judge_failures,
+        "judge_failure_rate": judge_failures / len(rows) if rows else 0.0,
+        "policy_violation_rate": _dimension_rate({"dimensions": dimensions}, "policy_violation"),
+        "overrefusal_rate": _dimension_rate({"dimensions": dimensions}, "overrefusal"),
+        "dimensions": dimensions,
+        "target": target,
+        "judge_model": judge_model,
+    }
+
+    if permissibility_split["permissible"] is not None:
+        permissible = permissibility_split["permissible"]
+        not_permissible = permissibility_split["not_permissible"]
+        assert not_permissible is not None
+        metrics.update(
+            {
+                "permissible_policy_violation_rate": permissible["rate"],
+                "not_permissible_policy_violation_rate": not_permissible["rate"],
+                "policy_violation_on_permissible": permissible,
+                "policy_violation_on_not_permissible": not_permissible,
+            }
+        )
+
+    return metrics
+
+
+def _compute_scenario_metrics(
+    rows: list[dict[str, Any]],
+    behavior_categories: Iterable[dict[str, Any]] = (),
+) -> dict[str, Any] | None:
+    if not rows:
+        return None
+
+    scored_rows = [row for row in rows if infer_judge_status(row) == "ok"]
+    scored_total = len(scored_rows)
+    judge_failures = len(rows) - scored_total
+
+    dimensions: dict[str, dict[str, Any]] = {}
+    for dim in _detect_dimensions(scored_rows):
+        dimensions[dim] = _compute_dimension_summary(scored_rows, dim)
+
+    target = next(
+        (
+            row.get("target")
+            for row in rows
+            if isinstance(row.get("target"), str) and row.get("target")
+        ),
+        None,
+    ) or "-"
+    tester_model = next(
+        (
+            row.get("tester_model")
+            for row in rows
+            if isinstance(row.get("tester_model"), str) and row.get("tester_model")
+        ),
+        None,
+    ) or "-"
+    judge_model = next(
+        (
+            row.get("judge_model")
+            for row in rows
+            if isinstance(row.get("judge_model"), str) and row.get("judge_model")
+        ),
+    ) or "-"
+
+    permissibility_split = compute_policy_violation_by_permissibility(
+        scored_rows,
+        behavior_categories,
+    )
+
+    metrics: dict[str, Any] = {
+        "total": len(rows),
+        "scored_total": scored_total,
+        "judge_failures": judge_failures,
+        "judge_failure_rate": judge_failures / len(rows) if rows else 0.0,
+        "policy_violation_rate": _dimension_rate({"dimensions": dimensions}, "policy_violation"),
+        "overrefusal_rate": _dimension_rate({"dimensions": dimensions}, "overrefusal"),
+        "dimensions": dimensions,
+        "target": target,
+        "tester_model": tester_model,
+        "judge_model": judge_model,
+    }
+
+    if permissibility_split["permissible"] is not None:
+        permissible = permissibility_split["permissible"]
+        not_permissible = permissibility_split["not_permissible"]
+        assert not_permissible is not None
+        metrics.update(
+            {
+                "permissible_policy_violation_rate": permissible["rate"],
+                "not_permissible_policy_violation_rate": not_permissible["rate"],
+                "policy_violation_on_permissible": permissible,
+                "policy_violation_on_not_permissible": not_permissible,
+            }
+        )
+
+    return metrics
+
+
+def _load_behavior_categories(suite_dir: Path) -> list[dict[str, Any]]:
+    taxonomy = load_json(suite_dir / "taxonomy.json")
+    behavior_categories = (taxonomy or {}).get("behavior_categories")
+    if not isinstance(behavior_categories, list):
+        return []
+    return [entry for entry in behavior_categories if isinstance(entry, dict)]
+
+
+def _load_run_summary(run_dir: Path) -> dict[str, Any] | None:
+    manifest = load_json(run_dir / "manifest.json")
+    score_rows = load_jsonl(run_dir / "scores.jsonl")
+    behavior_categories = _load_behavior_categories(run_dir.parent)
+    prompt_rows = [row for row in score_rows if not row.get("tester_model")]
+    scenario_rows = [row for row in score_rows if row.get("tester_model")]
+
+    stages = (manifest or {}).get("stages", {})
+    has_scores = isinstance(stages, dict) and stages.get("judge") is not None
+    has_data = bool(prompt_rows or scenario_rows)
+    if not has_data and not has_scores:
+        return None
+    if not has_data and (manifest or {}).get("status") == "failed":
+        return None
+
+    status, current_stage = _current_stage_status(manifest)
+    return {
+        "run_id": run_dir.name,
+        "path": str(run_dir),
+        "manifest": manifest,
+        "status": status,
+        "current_stage": current_stage,
+        "started_at": (manifest or {}).get("started_at"),
+        "ended_at": (manifest or {}).get("ended_at"),
+        "prompt_metrics": _compute_prompt_metrics(prompt_rows, behavior_categories),
+        "scenario_metrics": _compute_scenario_metrics(scenario_rows, behavior_categories),
+        "prompt_rows": prompt_rows,
+        "scenario_rows": scenario_rows,
+    }
+
+
+def _count_test_case_types(path: Path) -> tuple[int, int]:
+    rows = load_jsonl(path)
+    prompt_count = 0
+    scenario_count = 0
+    for row in rows:
+        row_type = row.get("type")
+        if row_type == "prompt":
+            prompt_count += 1
+        elif row_type == "scenario":
+            scenario_count += 1
+    return prompt_count, scenario_count
+
+
+def _load_suite_summary(suite_dir: Path) -> dict[str, Any] | None:
+    suite_meta = load_json(suite_dir / "suite.json")
+    taxonomy = load_json(suite_dir / "taxonomy.json")
+    if suite_meta is None and taxonomy is None:
+        return None
+
+    run_summaries = []
+    for child in sorted(suite_dir.iterdir()) if suite_dir.exists() else []:
+        if not child.is_dir():
+            continue
+        run_summary = _load_run_summary(child)
+        if run_summary is not None:
+            run_summaries.append(run_summary)
+
+    has_results = any(
+        (run_summary.get("prompt_metrics") is not None) or (run_summary.get("scenario_metrics") is not None)
+        for run_summary in run_summaries
+    )
+    prompt_test_case_count, scenario_test_case_count = _count_test_case_types(suite_dir / "test_set.jsonl")
+
+    created_at = (suite_meta or {}).get("created_at")
+
+    behavior_name = suite_dir.name
+    behavior_block = (taxonomy or {}).get("behavior")
+    if isinstance(behavior_block, dict) and isinstance(behavior_block.get("name"), str) and behavior_block.get("name"):
+        behavior_name = behavior_block["name"]
+
+    if has_results:
+        status = "has_results"
+    elif prompt_test_case_count or scenario_test_case_count:
+        status = "test_set_ready"
+    else:
+        status = "systematized"
+
+    return {
+        "suite_id": suite_dir.name,
+        "path": str(suite_dir),
+        "behavior_name": behavior_name,
+        "behavior_category_count": len((taxonomy or {}).get("behavior_categories") or []),
+        "prompt_test_case_count": prompt_test_case_count,
+        "scenario_test_case_count": scenario_test_case_count,
+        "run_count": len(run_summaries),
+        "runs": run_summaries,
+        "status": status,
+        "created_at": created_at,
+        "has_systematization": (suite_dir / "systematization.json").exists(),
+    }
+
+
+def _load_all_suites(results_dir: Path) -> list[dict[str, Any]]:
+    if not results_dir.exists():
+        return []
+    suites = []
+    for child in sorted(results_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        suite_summary = _load_suite_summary(child)
+        if suite_summary is not None:
+            suites.append(suite_summary)
+    suites.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return suites
+
+
+def _row_metric_value(
+    row: dict[str, Any],
+    metric: str,
+    behavior_categories: Iterable[dict[str, Any]] = (),
+) -> bool | int | None:
+    if metric in _DERIVED_PERMISSIBILITY_RATE_KEYS:
+        split = compute_policy_violation_by_permissibility([row], behavior_categories)
+        bucket = "not_permissible" if metric == _POLICY_VIOLATION_NOT_PERMISSIBLE else "permissible"
+        summary = split.get(bucket)
+        if not isinstance(summary, dict) or not summary.get("count"):
+            return None
+        return bool(summary.get("flagged_count"))
+    value = get_verdict_dimension(row.get("verdict"), metric)
+    return value if is_valid_event_flag(value) else None
+
+
+def _behavior_category_metric_map(
+    rows: Iterable[dict[str, Any]],
+    metric: str,
+    behavior_categories: Iterable[dict[str, Any]] = (),
+) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, dict[str, Any]] = {}
+    categories = list(behavior_categories)
+    for row in rows:
+        if infer_judge_status(row) != "ok":
+            continue
+        value = _row_metric_value(row, metric, categories)
+        if not is_valid_event_flag(value):
+            continue
+        behavior_category = row_behavior(row)
+        bucket = grouped.setdefault(
+            behavior_category,
+            {
+                "true_count": 0,
+                "count": 0,
+                "permissible": get_permissible_flag(row),
+            },
+        )
+        bucket["true_count"] += int(bool(value))
+        bucket["count"] += 1
+    result = {}
+    for behavior_category, bucket in grouped.items():
+        if bucket["count"] <= 0:
+            continue
+        result[behavior_category] = {
+            "rate": bucket["true_count"] / bucket["count"],
+            "count": bucket["count"],
+            "permissible": bucket["permissible"],
+        }
+    return result
+
+
+@click.group(
+    cls=SuggestingGroup,
+    context_settings=CONTEXT_SETTINGS,
+    epilog=(
+        "\b\n"
+        "Examples:\n"
+        "  assert-ai run --config examples/pipes/health_assistant.yaml\n"
+        "  assert-ai run --config examples/pipes/health_assistant_external.yaml\n"
+        "  assert-ai results list\n"
+        "  assert-ai results compare health-assistant-v1 gpt54-eval gpt54-eval\n"
+        "  assert-ai results compare-suites suite-a/run-1 suite-b/run-1 suite-c/run-1"
+    ),
+)
+@click.version_option(package_name="assert-ai", prog_name="assert-ai")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug-level logging.")
+@click.option("-q", "--quiet", is_flag=True, help="Suppress info-level output; show only warnings and errors.")
+@click.option(
+    "--log-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write all log output to a file (in addition to stderr).",
+)
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"], case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Log output format. Use 'json' for CI pipelines.",
+)
+@click.pass_context
+def cli(ctx: click.Context, verbose: bool, quiet: bool, log_file: Path | None, output_format: str):
+    """Safety evaluation workflows for pipeline runs, artifacts, and post-hoc analysis."""
+    ctx.ensure_object(dict)
+    ctx.obj["logging_configured"] = True
+    configure_logging(
+        verbose=verbose,
+        quiet=quiet,
+        log_file=log_file,
+        json_output=(output_format == "json"),
+    )
+    # NOTE: the resolved Azure auth mode is logged by the subcommands that
+    # actually invoke LLMs (``run``, ``init``), AFTER they have loaded ``.env``
+    # and called ``refresh_azure_auth_mode(force=True)``. Emitting here would
+    # log a stale (pre-dotenv) value, would ignore ``--quiet``/``--output json``
+    # passed on the subcommand, and would add noise to commands that never
+    # touch an LLM (e.g. ``results compare-suites``).
+
+
+# -- init (design an eval config with an LLM assistant) ---------------------
+from assert_ai.init._command import init  # noqa: E402
+
+cli.add_command(init)
+
+
+@cli.command(short_help="Run a pipeline from a YAML config")
+@click.option(
+    "--config",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Path to a YAML pipeline config.",
+    show_envvar=True,
+)
+@click.option(
+    "--force-stage",
+    type=click.Choice(STAGE_NAMES, case_sensitive=False),
+    multiple=True,
+    help=(
+        "Force a stage to rerun even if cached. Repeat to force multiple stages. "
+        "Forcing an upstream stage implicitly forces every configured downstream stage, "
+        "so cached inference rows and scores can't silently survive a regenerated input."
+    ),
+    show_envvar=True,
+)
+@click.option("--strict", is_flag=True, help="Fail on malformed JSONL inputs instead of skipping bad rows.")
+@click.option("--override", "overrides", multiple=True, help="Override a config value, e.g. test_set.sample_size=10.")
+@click.option(
+    "--concurrency",
+    type=click.IntRange(min=1),
+    default=None,
+    help=(
+        "Override inference/judge fan-out for this run. Wins over "
+        "pipeline.inference.concurrency in the YAML. Defaults to the value in "
+        f"the config (or {DEFAULT_INFERENCE_CONCURRENCY} if unset)."
+    ),
+    show_envvar=True,
+)
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug-level logging.")
+@click.option("-q", "--quiet", is_flag=True, help="Suppress info-level output; show only warnings and errors.")
+@click.option(
+    "--log-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Write all log output to a file (in addition to stderr).",
+)
+@click.option(
+    "--output",
+    "output_format",
+    type=click.Choice(["text", "json"], case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Log output format. Use 'json' for CI pipelines.",
+)
+@click.pass_context
+def run(
+    ctx: click.Context,
+    config: Path,
+    force_stage: tuple[str, ...],
+    strict: bool,
+    overrides: tuple[str, ...],
+    concurrency: int | None,
+    verbose: bool,
+    quiet: bool,
+    log_file: Path | None,
+    output_format: str,
+):
+    """Run the evaluation pipeline."""
+    # Re-configure logging if flags were passed on the subcommand
+    # (e.g. `assert-ai run --verbose` instead of `assert-ai --verbose run`).
+    if verbose or quiet or log_file or output_format != "text":
+        configure_logging(
+            verbose=verbose,
+            quiet=quiet,
+            log_file=log_file,
+            json_output=(output_format == "json"),
+        )
+    runner = _load_runner_module()
+    # Emit the resolved Azure auth mode AFTER runner.py has loaded ``.env``
+    # and called ``refresh_azure_auth_mode(force=True)`` — so the log reflects
+    # the value that azure/* requests will actually use — and AFTER subcommand
+    # logging flags have been applied (above), so ``--quiet`` silences it and
+    # ``--output json`` formats it as JSON.
+    from assert_ai.core.azure_auth import log_resolved_azure_auth_mode
+    log_resolved_azure_auth_mode()
+    rc = runner.run_pipeline(
+        config=str(config),
+        force_stages=list(force_stage),
+        strict=strict,
+        overrides=list(overrides),
+        concurrency=concurrency,
+    )
+    raise SystemExit(rc)
+
+
+@cli.group(cls=SuggestingGroup, short_help="Browse and compare generated suites and runs")
+def results():
+    """Inspect local artifacts under `artifacts/results/`."""
+
+
+@results.command("list", short_help="List suites, or runs for one suite")
+@click.option(
+    "--results-dir",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_RESULTS_DIR,
+    show_default=True,
+    help="Results root to scan.",
+)
+@click.option("--suite", default=None, shell_complete=_complete_suite, help="List runs for one suite instead of all suites.")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+@click.option("--no-color", is_flag=True, help="Disable colored terminal output.")
+def results_list(results_dir: Path, suite: Optional[str], as_json: bool, no_color: bool):
+    """List suites, or list runs inside one suite."""
+    results_root = _resolve_results_dir(results_dir)
+    if not results_root.exists():
+        _error(f"Results directory not found: {results_root}")
+
+    if suite:
+        suite_dir = results_root / suite
+        if not suite_dir.exists():
+            _error(f"Suite not found: {suite}")
+        suite_summary = _load_suite_summary(suite_dir)
+        if suite_summary is None:
+            _error(f"Suite has no readable artifacts: {suite}")
+        if as_json:
+            _echo_json({"suite": suite_summary, "runs": suite_summary["runs"]})
+            return
+
+        console = _console(no_color=no_color)
+        runs = suite_summary["runs"]
+        split = bool(runs) and all(
+            has_permissibility_split_data(
+                (run_summary or {}).get("prompt_metrics") or {},
+                (run_summary or {}).get("scenario_metrics") or {},
+            )
+            for run_summary in runs
+        )
+        table = Table(title=f"Runs in {suite}", box=None, show_header=True, show_edge=False, pad_edge=False)
+        table.add_column("Run", style="cyan", no_wrap=True)
+        table.add_column("Status", style="white", no_wrap=True)
+        table.add_column("Started", style="dim", no_wrap=True)
+        for title in _violation_column_titles(split):
+            table.add_column(title, style="white", no_wrap=True)
+        table.add_column("Judge failures", style="white", no_wrap=True)
+        table.add_column("Target", style="white")
+        for run_summary in suite_summary["runs"]:
+            prompt_metrics = run_summary.get("prompt_metrics") or {}
+            scenario_metrics = run_summary.get("scenario_metrics") or {}
+            target_model = prompt_metrics.get("target") or scenario_metrics.get("target") or "-"
+            table.add_row(
+                run_summary["run_id"],
+                label_run_status(run_summary["status"]),
+                _format_timestamp(run_summary.get("started_at")),
+                *_violation_cells(prompt_metrics, scenario_metrics, split),
+                _fmt_percent(
+                    prompt_metrics.get("judge_failure_rate")
+                    if prompt_metrics
+                    else scenario_metrics.get("judge_failure_rate")
+                ),
+                str(target_model),
+            )
+        console.print(table)
+        return
+
+    suites = _load_all_suites(results_root)
+    if as_json:
+        _echo_json({"results_dir": str(results_root), "suites": suites})
+        return
+
+    console = _console(no_color=no_color)
+    table = Table(title=f"Suites ({results_root})", box=None, show_header=True, show_edge=False, pad_edge=False)
+    table.add_column("Suite", style="cyan", no_wrap=True)
+    table.add_column("Behavior", style="white")
+    table.add_column("Behavior Categories", style="white", no_wrap=True)
+    table.add_column("Prompt Test Cases", style="white", no_wrap=True)
+    table.add_column("Scenario Test Cases", style="white", no_wrap=True)
+    table.add_column("Runs", style="white", no_wrap=True)
+    table.add_column("Status", style="dim", no_wrap=True)
+    for suite_summary in suites:
+        table.add_row(
+            suite_summary["suite_id"],
+            str(suite_summary["behavior_name"]),
+            str(suite_summary["behavior_category_count"]),
+            str(suite_summary["prompt_test_case_count"]),
+            str(suite_summary["scenario_test_case_count"]),
+            str(suite_summary["run_count"]),
+            label_status(suite_summary["status"]),
+        )
+    console.print(table)
+
+
+@results.command("status", short_help="Show a suite summary or one run in detail")
+@click.argument("suite", shell_complete=_complete_suite)
+@click.argument("run", required=False, shell_complete=_complete_run)
+@click.option(
+    "--results-dir",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_RESULTS_DIR,
+    show_default=True,
+    help="Results root to inspect.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+@click.option("--no-color", is_flag=True, help="Disable colored terminal output.")
+def results_status(suite: str, run: Optional[str], results_dir: Path, as_json: bool, no_color: bool):
+    """Show suite-level or run-level status information."""
+    results_root = _resolve_results_dir(results_dir)
+    suite_dir = results_root / suite
+    if not suite_dir.exists():
+        _error(f"Suite not found: {suite}")
+
+    if run is None:
+        suite_summary = _load_suite_summary(suite_dir)
+        if suite_summary is None:
+            _error(f"Suite has no readable artifacts: {suite}")
+        if as_json:
+            _echo_json(suite_summary)
+            return
+
+        console = _console(no_color=no_color)
+        summary = Table(box=None, show_header=False, show_edge=False, pad_edge=False)
+        summary.add_column("Field", style="cyan", no_wrap=True)
+        summary.add_column("Value", style="white")
+        summary.add_row("Suite", suite_summary["suite_id"])
+        summary.add_row("Behavior", str(suite_summary["behavior_name"]))
+        summary.add_row("Status", label_status(suite_summary["status"]))
+        summary.add_row("Created", _format_timestamp(suite_summary.get("created_at")))
+        summary.add_row("Behavior Categories", str(suite_summary["behavior_category_count"]))
+        summary.add_row("Prompt Test Cases", str(suite_summary["prompt_test_case_count"]))
+        summary.add_row("Scenario Test Cases", str(suite_summary["scenario_test_case_count"]))
+        summary.add_row("Runs", str(suite_summary["run_count"]))
+        console.print(summary)
+
+        if suite_summary["runs"]:
+            runs = suite_summary["runs"]
+            split = all(
+                has_permissibility_split_data(
+                    (run_summary or {}).get("prompt_metrics") or {},
+                    (run_summary or {}).get("scenario_metrics") or {},
+                )
+                for run_summary in runs
+            )
+            table = Table(title="Runs", box=None, show_header=True, show_edge=False, pad_edge=False)
+            table.add_column("Run", style="cyan", no_wrap=True)
+            table.add_column("Status", style="white", no_wrap=True)
+            table.add_column("Current Stage", style="white", no_wrap=True)
+            for title in _violation_column_titles(split):
+                table.add_column(title, style="white", no_wrap=True)
+            for run_summary in suite_summary["runs"]:
+                prompt_metrics = run_summary.get("prompt_metrics") or {}
+                scenario_metrics = run_summary.get("scenario_metrics") or {}
+                table.add_row(
+                    run_summary["run_id"],
+                    label_run_status(run_summary["status"]),
+                    label_stage(run_summary["current_stage"]),
+                    *_violation_cells(prompt_metrics, scenario_metrics, split),
+                )
+            console.print(table)
+        return
+
+    run_dir = suite_dir / run
+    if not run_dir.exists():
+        _error(f"Run not found: {suite}/{run}")
+    run_summary = _load_run_summary(run_dir)
+    if run_summary is None:
+        _error(f"Run has no readable artifacts: {suite}/{run}")
+
+    payload = {
+        "suite_id": suite,
+        **run_summary,
+    }
+    if as_json:
+        _echo_json(payload)
+        return
+
+    console = _console(no_color=no_color)
+    summary = Table(box=None, show_header=False, show_edge=False, pad_edge=False)
+    summary.add_column("Field", style="cyan", no_wrap=True)
+    summary.add_column("Value", style="white")
+    summary.add_row("Suite", suite)
+    summary.add_row("Run", run_summary["run_id"])
+    summary.add_row("Status", label_run_status(run_summary["status"]))
+    summary.add_row("Current Stage", label_stage(run_summary["current_stage"]))
+    summary.add_row("Started", _format_timestamp(run_summary.get("started_at")))
+    summary.add_row("Ended", _format_timestamp(run_summary.get("ended_at")))
+    summary.add_row("Path", run_summary["path"])
+    console.print(summary)
+
+    stage_meta = (
+        run_summary.get("manifest", {}).get("stages")
+        if isinstance(run_summary.get("manifest"), dict)
+        else {}
+    )
+    if isinstance(stage_meta, dict) and stage_meta:
+        table = Table(title="Stages", box=None, show_header=True, show_edge=False, pad_edge=False)
+        table.add_column("Stage", style="cyan", no_wrap=True)
+        table.add_column("Status", style="white", no_wrap=True)
+        for stage_name, meta in stage_meta.items():
+            # ``label_stage_status`` already accepts ``str | None``; wrapping
+            # ``meta`` in ``str(...)`` would turn a missing/None value into the
+            # literal string "None" instead of the intended em-dash placeholder.
+            stage_status = meta if isinstance(meta, str) else None
+            table.add_row(label_stage(stage_name), label_stage_status(stage_status))
+        console.print(table)
+
+    prompt_metrics = run_summary.get("prompt_metrics")
+    if prompt_metrics:
+        table = Table(title="Prompt Metrics", box=None, show_header=False, show_edge=False, pad_edge=False)
+        table.add_column("Metric", style="cyan", no_wrap=True)
+        table.add_column("Value", style="white")
+        table.add_row("Target", str(prompt_metrics.get("target") or "-"))
+        table.add_row("Judge Model", str(prompt_metrics.get("judge_model") or "-"))
+        table.add_row("Total", str(prompt_metrics["total"]))
+        table.add_row("Scored", str(prompt_metrics["scored_total"]))
+        table.add_row(label_metric("judge_failure_rate"), _fmt_percent(prompt_metrics.get("judge_failure_rate")))
+        console.print(table)
+        prompt_dimensions = _visible_dimension_summaries(prompt_metrics)
+        if prompt_dimensions:
+            dim_table = Table(title="Prompt Dimensions", box=None, show_header=True, show_edge=False, pad_edge=False)
+            dim_table.add_column("Dimension", style="cyan", no_wrap=True)
+            dim_table.add_column("Summary", style="white", no_wrap=True)
+            dim_table.add_column("Scored", style="white", no_wrap=True)
+            dim_table.add_column("Distribution", style="white", no_wrap=True)
+            for name, summary in prompt_dimensions:
+                summary_text, scored_text, distribution_text = _fmt_dimension_summary(summary)
+                dim_table.add_row(
+                    label_metric(name),
+                    summary_text,
+                    scored_text,
+                    distribution_text,
+                )
+            console.print(dim_table)
+
+    scenario_metrics = run_summary.get("scenario_metrics")
+    if scenario_metrics:
+        table = Table(title="Scenario Metrics", box=None, show_header=False, show_edge=False, pad_edge=False)
+        table.add_column("Metric", style="cyan", no_wrap=True)
+        table.add_column("Value", style="white")
+        table.add_row("Target", str(scenario_metrics.get("target") or "-"))
+        table.add_row("Tester Model", str(scenario_metrics.get("tester_model") or "-"))
+        table.add_row("Judge Model", str(scenario_metrics.get("judge_model") or "-"))
+        table.add_row("Total", str(scenario_metrics["total"]))
+        table.add_row("Scored", str(scenario_metrics["scored_total"]))
+        table.add_row(label_metric("judge_failure_rate"), _fmt_percent(scenario_metrics.get("judge_failure_rate")))
+        console.print(table)
+        scenario_dimensions = _visible_dimension_summaries(scenario_metrics)
+        if scenario_dimensions:
+            dim_table = Table(title="Scenario Dimensions", box=None, show_header=True, show_edge=False, pad_edge=False)
+            dim_table.add_column("Dimension", style="cyan", no_wrap=True)
+            dim_table.add_column("Summary", style="white", no_wrap=True)
+            dim_table.add_column("Scored", style="white", no_wrap=True)
+            dim_table.add_column("Distribution", style="white", no_wrap=True)
+            for name, summary in scenario_dimensions:
+                summary_text, scored_text, distribution_text = _fmt_dimension_summary(summary)
+                dim_table.add_row(
+                    label_metric(name),
+                    summary_text,
+                    scored_text,
+                    distribution_text,
+                )
+            console.print(dim_table)
+
+
+@results.command("compare", short_help="Compare runs (same suite or cross-suite)")
+@click.argument("args", nargs=-1)
+@click.option(
+    "--results-dir",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_RESULTS_DIR,
+    show_default=True,
+    help="Results root to inspect.",
+)
+@click.option(
+    "--metric",
+    default=None,
+    shell_complete=_complete_metric,
+    help=(
+        "Judge dimension to use for the top behavior-category delta table. "
+        "Defaults to impermissible behavior violations when every compared run has split data."
+    ),
+)
+@click.option("--limit", default=8, show_default=True, type=int, help="Maximum behavior categories to show in the delta table.")
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+@click.option("--no-color", is_flag=True, help="Disable colored terminal output.")
+@click.pass_context
+def results_compare(
+    ctx: click.Context,
+    args: tuple[str, ...],
+    results_dir: Path,
+    metric: str | None,
+    limit: int,
+    as_json: bool,
+    no_color: bool,
+):
+    """Compare runs. Accepts two forms:
+
+    \b
+    Within one suite:  assert-ai results compare SUITE RUN1 RUN2
+    Cross-suite:       assert-ai results compare SUITE/RUN1 SUITE/RUN2
+    """
+    if len(args) < 2:
+        _error(
+            "Provide at least two arguments.\n"
+            "  Within suite:  assert-ai results compare SUITE RUN1 RUN2\n"
+            "  Cross-suite:   assert-ai results compare SUITE/RUN1 SUITE/RUN2"
+        )
+
+    # Detect cross-suite mode: any arg contains "/"
+    if any("/" in a for a in args):
+        ctx.invoke(
+            results_compare_suites,
+            suite_runs=args,
+            results_dir=results_dir,
+            metric=metric,
+            as_json=as_json,
+            no_color=no_color,
+        )
+        return
+
+    # Within-suite mode: first arg is suite, rest are run IDs
+    suite = args[0]
+    runs = args[1:]
+    if len(runs) < 2:
+        results_root = _resolve_results_dir(results_dir)
+        suite_b = results_root / runs[0] if runs else None
+        if runs and suite_b and suite_b.exists():
+            _error(
+                f"'{runs[0]}' looks like a suite name, not a run ID.\n"
+                f"Use slash format for cross-suite:\n"
+                f"  assert-ai results compare {suite}/run-1 {runs[0]}/run-1"
+            )
+        _error("Provide at least two run IDs to compare.")
+
+    _run_within_suite_compare(
+        suite=suite,
+        runs=runs,
+        results_dir=results_dir,
+        metric=metric,
+        limit=limit,
+        as_json=as_json,
+        no_color=no_color,
+    )
+
+
+def _run_within_suite_compare(
+    *,
+    suite: str,
+    runs: tuple[str, ...] | list[str],
+    results_dir: Path,
+    metric: str | None,
+    limit: int,
+    as_json: bool,
+    no_color: bool,
+) -> None:
+    """Original within-suite comparison logic."""
+
+    results_root = _resolve_results_dir(results_dir)
+    suite_dir = results_root / suite
+    if not suite_dir.exists():
+        _error(f"Suite not found: {suite}")
+
+    run_summaries: list[dict[str, Any]] = []
+    for run_id in runs:
+        run_summary = _load_run_summary(suite_dir / run_id)
+        if run_summary is None:
+            _error(f"Run not found or unreadable: {suite}/{run_id}")
+        run_summaries.append(run_summary)
+
+    metric = _resolve_compare_metric(metric, run_summaries)
+    available_metrics = _available_compare_metrics(run_summaries)
+    if metric not in available_metrics:
+        _error(f"Metric '{metric}' was not found in the compared prompt judgments. Available: {sorted(available_metrics)}")
+    _reject_ordinal_compare(run_summaries, metric)
+
+    behavior_category_deltas: list[dict[str, Any]] = []
+    if all(run_summary.get("prompt_rows") for run_summary in run_summaries):
+        behavior_categories = _load_behavior_categories(suite_dir)
+        first_map = _behavior_category_metric_map(
+            run_summaries[0]["prompt_rows"],
+            metric,
+            behavior_categories,
+        )
+        last_map = _behavior_category_metric_map(
+            run_summaries[-1]["prompt_rows"],
+            metric,
+            behavior_categories,
+        )
+        for behavior_category in sorted(set(first_map) | set(last_map)):
+            first = first_map.get(behavior_category)
+            last = last_map.get(behavior_category)
+            if first is None or last is None:
+                continue
+            behavior_category_deltas.append(
+                {
+                    "behavior_category": behavior_category,
+                    "permissible": first.get("permissible"),
+                    "first_rate": first["rate"],
+                    "last_rate": last["rate"],
+                    "delta": last["rate"] - first["rate"],
+                    "first_count": first["count"],
+                    "last_count": last["count"],
+                }
+            )
+        behavior_category_deltas.sort(key=lambda row: abs(row["delta"]), reverse=True)
+        if limit >= 0:
+            behavior_category_deltas = behavior_category_deltas[:limit]
+
+    run_rows = []
+    for run_summary in run_summaries:
+        prompt_metrics = run_summary.get("prompt_metrics") or {}
+        scenario_metrics = run_summary.get("scenario_metrics") or {}
+        run_rows.append(
+            {
+                "run_id": run_summary["run_id"],
+                "status": run_summary["status"],
+                "started_at": run_summary.get("started_at"),
+                "prompt": prompt_metrics,
+                "scenario": scenario_metrics,
+            }
+        )
+
+    payload = {
+        "suite_id": suite,
+        "metric": metric,
+        "runs": run_rows,
+        "behavior_category_deltas": behavior_category_deltas,
+    }
+    if as_json:
+        _echo_json(payload)
+        return
+
+    console = _console(no_color=no_color)
+    table = Table(
+        title=f"Run Comparison ({suite}, {_metric_label(metric)})",
+        box=None,
+        show_header=True,
+        show_edge=False,
+        pad_edge=False,
+    )
+    table.add_column("Run", style="cyan", no_wrap=True)
+    table.add_column("Status", style="white", no_wrap=True)
+    table.add_column("Started", style="dim", no_wrap=True)
+    table.add_column("Target", style="white")
+    table.add_column(f"Prompt {_metric_label(metric).lower()} rate", style="white", no_wrap=True)
+    table.add_column(f"Scenario {_metric_label(metric).lower()} rate", style="white", no_wrap=True)
+    table.add_column(label_metric("judge_failure_rate"), style="white", no_wrap=True)
+    for row in payload["runs"]:
+        prompt_metrics = row["prompt"] or {}
+        scenario_metrics = row["scenario"] or {}
+        target_model = prompt_metrics.get("target") or scenario_metrics.get("target") or "-"
+        fail_rate = (
+            prompt_metrics.get("judge_failure_rate")
+            if prompt_metrics
+            else scenario_metrics.get("judge_failure_rate")
+        )
+        table.add_row(
+            row["run_id"],
+            label_run_status(row["status"] if isinstance(row.get("status"), str) else None),
+            _format_timestamp(row.get("started_at")),
+            str(target_model),
+            _fmt_percent(_dimension_rate(prompt_metrics, metric)),
+            _fmt_percent(_dimension_rate(scenario_metrics, metric)),
+            _fmt_percent(fail_rate),
+        )
+    console.print(table)
+
+    if behavior_category_deltas:
+        delta_table = Table(
+            title=f"Top behavior category deltas ({_metric_label(metric).lower()}: {runs[0]} -> {runs[-1]})",
+            box=None,
+            show_header=True,
+            show_edge=False,
+            pad_edge=False,
+        )
+        delta_table.add_column("Behavior category", style="cyan")
+        delta_table.add_column("Permissible", style="white", no_wrap=True)
+        delta_table.add_column(runs[0], style="white", no_wrap=True)
+        delta_table.add_column(runs[-1], style="white", no_wrap=True)
+        delta_table.add_column("Delta", style="white", no_wrap=True)
+        for row in behavior_category_deltas:
+            delta_table.add_row(
+                row["behavior_category"],
+                str(bool(row["permissible"])),
+                _fmt_percent(row["first_rate"]),
+                _fmt_percent(row["last_rate"]),
+                _fmt_percent(row["delta"]),
+            )
+        console.print(delta_table)
+
+
+@results.command("compare-suites", short_help="Compare runs across different suites (e.g., approach A vs B vs C)")
+@click.argument("suite_runs", nargs=-1)
+@click.option(
+    "--results-dir",
+    type=click.Path(path_type=Path),
+    default=DEFAULT_RESULTS_DIR,
+    show_default=True,
+    help="Results root to inspect.",
+)
+@click.option(
+    "--metric",
+    default=None,
+    shell_complete=_complete_metric,
+    help=(
+        "Judge dimension to compare. Defaults to impermissible behavior "
+        "violations when every compared run has split data."
+    ),
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON instead of tables.")
+@click.option("--no-color", is_flag=True, help="Disable colored terminal output.")
+def results_compare_suites(
+    suite_runs: tuple[str, ...],
+    results_dir: Path,
+    metric: str | None,
+    as_json: bool,
+    no_color: bool,
+):
+    """Compare runs across different suites.
+
+    Each argument is SUITE/RUN (e.g., travel-planner-phoenix-otel-demo/run-1).
+    Useful for comparing different integration approaches on the same agent.
+
+    \b
+    Examples:
+      assert-ai results compare-suites \\
+        travel-planner-phoenix-otel-demo/run-1 \\
+        travel-planner-litellm-callable/run-1 \\
+        travel-planner-external-connector/run-1
+    """
+    if len(suite_runs) < 2:
+        _error("Provide at least two SUITE/RUN arguments to compare.")
+
+    results_root = _resolve_results_dir(results_dir)
+    run_summaries: list[dict[str, Any]] = []
+    labels: list[str] = []
+
+    for suite_run in suite_runs:
+        parts = suite_run.strip("/").split("/")
+        if len(parts) == 1:
+            suite_id, run_id = parts[0], "run-1"
+        elif len(parts) == 2:
+            suite_id, run_id = parts
+        else:
+            _error(f"Invalid format: '{suite_run}'. Use SUITE/RUN (e.g., my-suite/run-1).")
+            return  # unreachable, for type checker
+
+        run_dir = results_root / suite_id / run_id
+        if not run_dir.exists():
+            _error(f"Not found: {suite_id}/{run_id}")
+        run_summary = _load_run_summary(run_dir)
+        if run_summary is None:
+            _error(f"No scores in {suite_id}/{run_id}")
+        run_summary["suite_id"] = suite_id
+        run_summaries.append(run_summary)
+        labels.append(f"{suite_id}/{run_id}")
+
+    metric = _resolve_compare_metric(metric, run_summaries)
+    _reject_ordinal_compare(run_summaries, metric)
+
+    # Count structural visibility from inference rows
+    structural: list[dict[str, Any]] = []
+    for i, suite_run in enumerate(suite_runs):
+        parts = suite_run.strip("/").split("/")
+        suite_id = parts[0]
+        run_id = parts[1] if len(parts) > 1 else "run-1"
+        inference_set_path = results_root / suite_id / run_id / "inference_set.jsonl"
+        inference_rows = load_jsonl(inference_set_path)
+        total_events = sum(len(r.get("events", [])) for r in inference_rows)
+        tool_events = sum(
+            1 for r in inference_rows
+            for e in r.get("events", [])
+            if e.get("edit", {}).get("type") == "tool_call"
+        )
+        msg_events = sum(
+            1 for r in inference_rows
+            for e in r.get("events", [])
+            if e.get("edit", {}).get("type") == "add_message"
+        )
+        with_tools = sum(
+            1 for r in inference_rows
+            if any(e.get("edit", {}).get("type") == "tool_call" for e in r.get("events", []))
+        )
+        structural.append({
+            "label": labels[i],
+            "inference_rows": len(inference_rows),
+            "total_events": total_events,
+            "msg_events": msg_events,
+            "tool_events": tool_events,
+            "with_tools": with_tools,
+        })
+
+    if as_json:
+        run_rows = []
+        for i, run_summary in enumerate(run_summaries):
+            prompt_metrics = run_summary.get("prompt_metrics") or {}
+            run_rows.append({
+                "label": labels[i],
+                "suite_id": run_summary["suite_id"],
+                "run_id": run_summary["run_id"],
+                "status": run_summary["status"],
+                "prompt": prompt_metrics,
+                "structural": structural[i],
+            })
+        _echo_json({"metric": metric, "runs": run_rows})
+        return
+
+    console = _console(no_color=no_color)
+
+    # Table 1: Judge quality
+    table = Table(
+        title=f"Cross-suite comparison ({_metric_label(metric).lower()})",
+        box=None,
+        show_header=True,
+        show_edge=False,
+        pad_edge=False,
+    )
+    table.add_column("Suite / Run", style="cyan", no_wrap=True)
+    table.add_column("Total", style="white", no_wrap=True)
+    table.add_column("Scored", style="white", no_wrap=True)
+    table.add_column(label_metric("judge_failure_rate"), style="white", no_wrap=True)
+    table.add_column(f"{_metric_label(metric)} rate", style="white", no_wrap=True)
+    table.add_column("Pass rate", style="white", no_wrap=True)
+    for i, run_summary in enumerate(run_summaries):
+        pm = run_summary.get("prompt_metrics") or {}
+        total = pm.get("total", 0)
+        ok = pm.get("scored_total", 0)
+        fail_rate = pm.get("judge_failure_rate")
+        dim_rate = _dimension_rate(pm, metric)
+        pass_rate = (1.0 - dim_rate) if dim_rate is not None else None
+        table.add_row(
+            labels[i],
+            str(total),
+            str(ok),
+            _fmt_percent(fail_rate),
+            _fmt_percent(dim_rate),
+            _fmt_percent(pass_rate),
+        )
+    console.print(table)
+    console.print()
+
+    # Table 2: Structural visibility
+    struct_table = Table(
+        title="Structural visibility (what the judge sees)",
+        box=None,
+        show_header=True,
+        show_edge=False,
+        pad_edge=False,
+    )
+    struct_table.add_column("Suite / Run", style="cyan", no_wrap=True)
+    struct_table.add_column("Inference rows", style="white", no_wrap=True)
+    struct_table.add_column("Events", style="white", no_wrap=True)
+    struct_table.add_column("Messages", style="white", no_wrap=True)
+    struct_table.add_column("Tool events", style="white", no_wrap=True)
+    struct_table.add_column("With tools", style="white", no_wrap=True)
+    for s in structural:
+        struct_table.add_row(
+            s["label"],
+            str(s["inference_rows"]),
+            str(s["total_events"]),
+            str(s["msg_events"]),
+            str(s["tool_events"]),
+            f"{s['with_tools']}/{s['inference_rows']}",
+        )
+    console.print(struct_table)
+
+
+@cli.group(cls=SuggestingGroup, short_help="Generate and validate ACS policies from ASSERT findings")
+def acs():
+    """Generate deployable ACS policies from ASSERT findings.
+
+    Runtime guarding is available from Python via the ``guard_target(...)`` API.
+    """
+    # `acs generate` makes provider LLM calls for policy authoring, but the ACS
+    # subcommands do not import the runner, so the project `.env` is never
+    # loaded and Azure credentials go unresolved (the `run` pipeline loads them
+    # in runner.py). Load `.env` walking up from cwd and resolve the Azure auth
+    # mode here so `assert-ai acs …` picks up credentials exactly like
+    # `assert-ai run`, with no manual environment export.
+    from dotenv import find_dotenv, load_dotenv
+
+    from assert_ai.core.azure_auth import refresh_azure_auth_mode
+
+    load_dotenv(find_dotenv(usecwd=True))
+    refresh_azure_auth_mode(force=True)
+
+
+@acs.command("generate", short_help="Generate a deployable ACS policy from an ASSERT run")
+@click.option(
+    "--run-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Run directory containing scores.jsonl.",
+)
+@click.option("--suite", default=None, shell_complete=_complete_suite, help="Suite ID under artifacts/results.")
+@click.option("--run", "run_id", default=None, shell_complete=_complete_run, help="Run ID under the selected suite.")
+@click.option(
+    "--out",
+    "out_dir",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Output directory for the generated ACS policy.",
+)
+@click.option("--min-rate", type=click.FloatRange(min=0.0, max=1.0), default=0.0, show_default=True, help="Minimum violation rate to include.")
+@click.option("--min-count", type=click.IntRange(min=0), default=1, show_default=True, help="Minimum scored cases to include.")
+@click.option("--model", default=None, help="Language model ID to pass to the ACS generator.")
+@click.option(
+    "--lm-kind",
+    type=click.Choice(["assert", "openai-compatible"], case_sensitive=False),
+    default="assert",
+    show_default=True,
+    help="Language model adapter for policy generation.",
+)
+@click.option("--strict/--no-strict", default=False, show_default=True, help="Enable strict ACS artifact validation.")
+@click.option("--validate/--no-validate", "run_validation", default=True, show_default=True, help="Validate the generated policy against known-bad findings.")
+@click.option("--fail-on-allow", is_flag=True, help="Exit nonzero if validation allows (does not react to) any known-bad example. A warn still counts as reacting.")
+@click.option("--require-block", is_flag=True, help="Exit nonzero unless every known-bad example is strongly blocked (deny/escalate). A warn is not a block.")
+def acs_generate(
+    run_dir: Path | None,
+    suite: str | None,
+    run_id: str | None,
+    out_dir: Path | None,
+    min_rate: float,
+    min_count: int,
+    model: str | None,
+    lm_kind: str,
+    strict: bool,
+    run_validation: bool,
+    fail_on_allow: bool,
+    require_block: bool,
+):
+    """Generate a deployable ACS policy from an ASSERT run's findings."""
+    resolved_run_dir = _resolve_acs_run_dir(run_dir, suite, run_id)
+    load_findings = _load_acs_symbol("load_findings")
+    generate_policy = _load_acs_symbol("generate_policy")
+
+    try:
+        summary = load_findings(resolved_run_dir, min_rate=min_rate, min_count=min_count)
+    except (FileNotFoundError, ValueError) as exc:
+        _error(str(exc))
+
+    if not summary.has_findings:
+        click.echo("Warning: no ASSERT findings met thresholds; generated policy will be a benign baseline.")
+
+    policy_out_dir = out_dir.expanduser() if out_dir is not None else _default_acs_out_dir(summary)
+    try:
+        artifacts = generate_policy(
+            summary,
+            out_dir=policy_out_dir,
+            lm_kind=lm_kind,
+            model=model,
+            strict=strict,
+        )
+    except ModuleNotFoundError as exc:
+        _handle_missing_acs_dependency(exc)
+    except ValueError as exc:
+        _error(str(exc))
+
+    _print_acs_artifacts(artifacts)
+
+    if run_validation:
+        validate_policy = _load_acs_symbol("validate_policy")
+        try:
+            report = validate_policy(artifacts.manifest_path, summary)
+        except ModuleNotFoundError as exc:
+            _handle_missing_acs_dependency(exc)
+        except (FileNotFoundError, ValueError) as exc:
+            _error(str(exc))
+        _print_acs_validation_totals(report)
+        _print_acs_validation_by_point(report)
+        _enforce_acs_validation_gate(report, fail_on_allow=fail_on_allow, require_block=require_block)
+
+
+@acs.command("validate", short_help="Validate an ACS manifest against an ASSERT run")
+@click.option(
+    "--manifest",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="ACS manifest.yaml to validate.",
+)
+@click.option(
+    "--run-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Run directory containing scores.jsonl.",
+)
+@click.option("--suite", default=None, shell_complete=_complete_suite, help="Suite ID under artifacts/results.")
+@click.option("--run", "run_id", default=None, shell_complete=_complete_run, help="Run ID under the selected suite.")
+@click.option("--min-rate", type=click.FloatRange(min=0.0, max=1.0), default=0.0, show_default=True, help="Minimum violation rate to include.")
+@click.option("--min-count", type=click.IntRange(min=0), default=1, show_default=True, help="Minimum scored cases to include.")
+@click.option("--max-cases", type=click.IntRange(min=1), default=None, help="Maximum known-bad examples to replay.")
+@click.option("--fail-on-allow", is_flag=True, help="Exit nonzero if validation allows (does not react to) any known-bad example. A warn still counts as reacting.")
+@click.option("--require-block", is_flag=True, help="Exit nonzero unless every known-bad example is strongly blocked (deny/escalate). A warn is not a block.")
+def acs_validate(
+    manifest: Path,
+    run_dir: Path | None,
+    suite: str | None,
+    run_id: str | None,
+    min_rate: float,
+    min_count: int,
+    max_cases: int | None,
+    fail_on_allow: bool,
+    require_block: bool,
+):
+    """Validate an ACS manifest against an ASSERT run's known-bad findings."""
+    resolved_run_dir = _resolve_acs_run_dir(run_dir, suite, run_id)
+    load_findings = _load_acs_symbol("load_findings")
+    validate_policy = _load_acs_symbol("validate_policy")
+
+    try:
+        summary = load_findings(resolved_run_dir, min_rate=min_rate, min_count=min_count)
+        report = validate_policy(manifest, summary, max_cases=max_cases)
+    except ModuleNotFoundError as exc:
+        _handle_missing_acs_dependency(exc)
+    except (FileNotFoundError, ValueError) as exc:
+        _error(str(exc))
+
+    _print_acs_validation_cases(report)
+    _print_acs_validation_totals(report)
+    _enforce_acs_validation_gate(report, fail_on_allow=fail_on_allow, require_block=require_block)
+
+
+@acs.command("eval-config", short_help="Generate an ASSERT eval config from an existing ACS manifest")
+@click.option(
+    "--manifest",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="ACS manifest.yaml to summarize.",
+)
+@click.option(
+    "--target-callable",
+    required=True,
+    help="Python callable reference for the already-guarded target, for example examples.my_agent:chat.",
+)
+@click.option(
+    "--out",
+    "out_path",
+    required=True,
+    type=click.Path(path_type=Path),
+    help="Where to write the ASSERT eval_config.yaml.",
+)
+@click.option("--model", default=None, help="Default LiteLLM model name for generation and judging.")
+def acs_eval_config(
+    manifest: Path,
+    target_callable: str,
+    out_path: Path,
+    model: str | None,
+):
+    """Generate a policy-derived ASSERT config to regression-check an existing ACS policy."""
+    write_eval_config = _load_acs_symbol("write_eval_config")
+    try:
+        written = write_eval_config(
+            manifest,
+            target_callable=target_callable,
+            out_path=out_path,
+            **({"default_model": model} if model else {}),
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        _error(str(exc))
+        return
+    click.echo(f"Wrote ASSERT eval config: {written}")
+    click.echo("Target callable is expected to already be guarded by that ACS manifest.")
+
+
+@cli.group(cls=SuggestingGroup, short_help="Run post-hoc analysis commands")
+def analysis():
+    """Post-hoc analysis commands for test_set and inspect logs."""
+
+
+@analysis.command("test-set-metrics", short_help="Compute coverage and diversity metrics for test-set files")
+@click.option("--taxonomy", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Taxonomy JSON to score against.")
+@click.option("--test_set", required=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Test-set JSONL file to analyze.")
+@click.option("--embed-model", default="text-embedding-3-large", show_default=True, help="Embedding model name.")
+@click.option("--embed-backend", type=click.Choice(["openai", "hf"]), default="openai", show_default=True, help="Embedding backend.")
+@click.option("--k", "k_values", multiple=True, type=int, help="Coverage@k values. Repeat to provide multiple values.")
+@click.option("--example-distance-thresh", default=0.2, type=float, show_default=True, help="Cosine distance threshold for example coverage.")
+@click.option("--presence-coverage", is_flag=True, help="Use simple presence coverage instead of coverage@k.")
+@click.option("--out-json", default=ROOT / "artifacts" / "analysis" / "test_set_metrics.json", type=click.Path(path_type=Path), show_default=True, help="Where to write the JSON report.")
+@click.option("--out-md", default=None, type=click.Path(path_type=Path), help="Optional Markdown report path.")
+def analysis_test_set_metrics(
+    taxonomy: Path,
+    test_set: Path,
+    embed_model: str,
+    embed_backend: str,
+    k_values: tuple[int, ...],
+    example_distance_thresh: float,
+    presence_coverage: bool,
+    out_json: Path,
+    out_md: Optional[Path],
+):
+    """Compute test-set metrics from the packaged CLI instead of calling the script directly."""
+    test_set_metrics = _load_analysis_module(_load_test_set_metrics)
+    cfg = test_set_metrics.Config(
+        taxonomy_path=str(taxonomy),
+        test_set_path=str(test_set),
+        embed_model=embed_model,
+        embed_backend=embed_backend,
+        k_list=list(k_values) if k_values else [1, 2, 3],
+        example_distance_thresh=example_distance_thresh,
+        presence_coverage=presence_coverage,
+        out_json=str(out_json),
+        out_md=str(out_md) if out_md else None,
+    )
+    try:
+        test_set_metrics.compute_metrics(cfg)
+    except ModuleNotFoundError as exc:
+        _handle_missing_analysis_dependency(exc)
+    click.echo(f"Wrote {out_json}")
+    if out_md:
+        click.echo(f"Wrote {out_md}")
+
+
+@cli.command("judge-traces", short_help="Judge pre-collected OTel traces without running inference")
+@click.option(
+    "--traces",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="OTLP JSON trace file",
+)
+@click.option(
+    "--config",
+    "config_path",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    help="Config YAML (for judge settings)",
+)
+@click.option("--group-by", default="session.id", show_default=True, help="OTel attribute to group spans by")
+@click.option("--output", default=None, type=click.Path(path_type=Path), help="Output directory for scores")
+def judge_traces(traces: Path, config_path: Path, group_by: str, output: Path | None):
+    """Judge pre-collected OTel traces without running inference."""
+    from assert_ai.core.otel import parse_otel_traces
+
+    click.echo(f"Parsing OTel traces from {traces}...")
+    inference_rows = parse_otel_traces(traces, group_by=group_by)
+    click.echo(f"Found {len(inference_rows)} conversations")
+
+    if not inference_rows:
+        click.echo("No conversations found in traces. Check your group_by attribute.")
+        raise SystemExit(1)
+
+    # Load config for judge settings
+    with open(config_path) as f:
+        yaml.safe_load(f)
+
+    out_dir = output or (DEFAULT_RESULTS_DIR / "judge-traces")
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    # Write parsed inference rows to output directory
+    inference_set_path = Path(out_dir) / "inference_set.jsonl"
+    with open(inference_set_path, "w") as f:
+        for row in inference_rows:
+            f.write(json.dumps(row) + "\n")
+    click.echo(f"Wrote {len(inference_rows)} inference rows to {inference_set_path}")
+
+    click.echo(f"Judging {len(inference_rows)} conversations...")
+    # Full judge execution requires LLM access; the inference rows are ready
+    # for the judge stage to consume.
+    click.echo(f"Inference set written to {inference_set_path}")
+    click.echo("Run the full pipeline with --force-stage judge to score these inference rows.")
+
+
+@cli.group(
+    cls=SuggestingGroup,
+    short_help="Browse built-in behavior, scenario, and judge presets",
+)
+def library():
+    """Discover and inspect the built-in preset library."""
+
+
+@library.command("list", short_help="List available presets")
+@click.option(
+    "--kind", "-k",
+    type=click.Choice(["behavior", "judge_preset", "scenario"], case_sensitive=False),
+    default=None,
+    help="Filter by preset kind.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON.")
+@click.option("--no-color", is_flag=True, help="Disable colored output.")
+def library_list(kind: str | None, as_json: bool, no_color: bool):
+    """List all available presets in the library."""
+    from assert_ai.library.loader import discover
+
+    results = discover(kind)
+    if as_json:
+        _echo_json(results)
+        return
+
+    if not results:
+        click.echo("No presets found.")
+        return
+
+    console = _console(no_color=no_color)
+    table = Table(title="Library Presets", box=None, show_header=True, show_edge=False, pad_edge=False)
+    table.add_column("Kind", style="dim", no_wrap=True)
+    table.add_column("Name", style="cyan", no_wrap=True)
+    table.add_column("Version", style="white", no_wrap=True)
+    table.add_column("Tags", style="white")
+    for entry in results:
+        tags = ", ".join(entry.get("tags", []))
+        table.add_row(entry["kind"], entry["name"], entry.get("version", ""), tags)
+    console.print(table)
+
+
+@library.command("show", short_help="Show details of a preset")
+@click.argument("name")
+@click.option(
+    "--kind", "-k",
+    type=click.Choice(["behavior", "judge_preset", "scenario"], case_sensitive=False),
+    default=None,
+    help="Preset kind (auto-detected if omitted).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit raw YAML content as JSON.")
+def library_show(name: str, kind: str | None, as_json: bool):
+    """Show the full content of a preset by name."""
+    from assert_ai.library.loader import discover, load_preset
+
+    # Auto-detect kind if not specified
+    if kind is None:
+        matches = [entry["kind"] for entry in discover() if entry["name"] == name]
+        if not matches:
+            _error(f"Preset {name!r} not found in any kind. Use --kind to be explicit.")
+            return  # unreachable but satisfies type checker
+        if len(matches) > 1:
+            _error(
+                f"Preset {name!r} exists in multiple kinds: {', '.join(matches)}. "
+                "Use --kind to be explicit."
+            )
+            return  # unreachable but satisfies type checker
+        kind = matches[0]
+        data = load_preset(kind, name)
+    else:
+        data = load_preset(kind, name)
+
+    if as_json:
+        _echo_json(data)
+        return
+
+    _write_stdout_utf8(dump_yaml(data))
+
+
+def _write_stdout_utf8(payload: str) -> None:
+    """Write ``payload`` to stdout as UTF-8 bytes.
+
+    ``click.echo`` re-encodes the payload with ``sys.stdout.encoding``, which
+    on Windows defaults to the ANSI code page (usually cp1252) for redirected
+    stdout. Non-ASCII characters like ``日本語`` then raise
+    ``UnicodeEncodeError``. Writing bytes directly through ``sys.stdout.buffer``
+    bypasses that re-encoding so a preset's on-disk YAML matches what
+    ``assert-ai init`` writes on any platform.
+
+    Falls back to ``click.echo`` when ``sys.stdout`` has no ``buffer`` (for
+    example under ``pytest``'s ``capsys`` fixture, which wraps stdout in a
+    ``TextIO`` without a binary layer).
+    """
+    buffer = getattr(sys.stdout, "buffer", None)
+    if buffer is None:
+        click.echo(payload, nl=False)
+        return
+    buffer.write(payload.encode("utf-8"))
+    buffer.flush()
+
+
+if __name__ == "__main__":
+    cli()

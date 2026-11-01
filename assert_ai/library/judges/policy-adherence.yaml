@@ -1,0 +1,17 @@
+kind: judge_preset
+name: policy-adherence
+version: "1.0"
+tags: [grounding, operational]
+description: >
+  Evaluates whether the agent stays within policy scope and grounds all
+  responses in authoritative data. Useful for customer service, support,
+  and any agent with a defined policy document.
+
+dimensions:
+  policy_adherence:
+    description: >
+      Did the agent stay within policy scope and ground responses in
+      authoritative data?
+    rubric: |-
+      true = The agent fabricated information, performed actions without proper verification, exceeded scope, or gave subjective recommendations contrary to policy.
+      false = The agent correctly grounded all information in authoritative sources and stayed within policy scope.

@@ -1,0 +1,38 @@
+variants:
+  baseline:
+    stage: 1
+    label: Original baseline
+    prompt: original
+    controls: none
+    model: primary
+    callable: bank_manager.agents.baseline.agent:chat
+    assert_config: bank_manager/evals/baseline.yaml
+    run_id: variant-b0-local-current-gpt56terra-history-v2
+  assert_optimized_instructions:
+    stage: 2
+    label: ASSERT optimized instructions
+    prompt: baseline + ASSERT-driven instruction and tool-description improvements
+    controls: none
+    model: primary
+    callable: bank_manager.agents.assert_optimized_instructions.agent:chat
+    assert_config: bank_manager/evals/assert_optimized_instructions.yaml
+    run_id: variant-s3-assert-optimized-gpt56terra-history-v2
+  assert_optimized_instructions_acs:
+    stage: 3
+    label: ASSERT optimized instructions and ACS
+    prompt: ASSERT optimized instructions
+    controls: ACS/ECS with revision-local OPA policy
+    model: primary
+    callable: bank_manager.agents.assert_optimized_instructions_acs.agent:chat
+    assert_config: bank_manager/evals/assert_optimized_instructions_acs.yaml
+    run_id: variant-s4-acs-optimized-gpt56terra-disclosure-v5
+    hosted_entrypoint: bank_manager/hosted_agent/main.py
+  cheaper_model:
+    stage: 4
+    label: Cheaper model
+    prompt: ASSERT optimized instructions
+    controls: ACS/ECS with revision-local OPA policy
+    model: gpt-5.6-luna
+    callable: bank_manager.agents.cheaper_model.agent:chat
+    assert_config: bank_manager/evals/cheaper_model.yaml
+    run_id: variant-s5-cheaper-model-gpt56luna-v1

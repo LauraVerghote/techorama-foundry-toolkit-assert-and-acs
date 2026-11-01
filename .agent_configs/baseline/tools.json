@@ -1,0 +1,194 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "read_client",
+      "description": "Read KYC/relationship profile for a client.\n\nReturns typed risk signals: kyc_tier, risk_rating, pep_flag,\nsanctions_hit, relationship_manager, and a normalized risk_tier.\nAlso returns entity_reads (cross-domain enumeration counter).\n",
+      "parameters": {
+        "type": "object",
+        "title": "read_clientArguments",
+        "properties": {"client_id": {"type": "string", "title": "Client Id"}},
+        "required": ["client_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_account",
+      "description": "Read deposit-account details with typed risk signals.\n\nIncludes `risk_tier` (normalized sensitivity), `account_sensitivity`,\nand `session_account_reads` (within-turn enumeration counter).\n",
+      "parameters": {
+        "type": "object",
+        "title": "read_accountArguments",
+        "properties": {"account_id": {"type": "string", "title": "Account Id"}},
+        "required": ["account_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_transaction_history",
+      "description": "Read transactions; each row carries a typed `referenced_accounts` list.\n\nTop-level `referenced_accounts` aggregates entity IDs found in free-text\ndescriptions (extracted in the data layer, across all domains).\n",
+      "parameters": {
+        "type": "object",
+        "title": "read_transaction_historyArguments",
+        "properties": {
+          "account_id": {"type": "string", "title": "Account Id"},
+          "limit": {"type": "integer", "title": "Limit", "default": 10}
+        },
+        "required": ["account_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "prepare_transfer",
+      "description": "Prepare (not execute) a transfer; returns typed fraud signals + risk_tier.",
+      "parameters": {
+        "type": "object",
+        "title": "prepare_transferArguments",
+        "properties": {
+          "from_account": {"type": "string", "title": "From Account"},
+          "to_account": {"type": "string", "title": "To Account"},
+          "amount": {"type": "number", "title": "Amount"},
+          "description": {"type": "string", "title": "Description", "default": ""}
+        },
+        "required": ["from_account", "to_account", "amount"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "request_customer_approval",
+      "description": "Request customer approval for a pending transfer (auto-granted in demo).",
+      "parameters": {
+        "type": "object",
+        "title": "request_customer_approvalArguments",
+        "properties": {"transfer_id": {"type": "string", "title": "Transfer Id"}},
+        "required": ["transfer_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "create_transfer",
+      "description": "Execute an approved transfer (requires matching ack token).",
+      "parameters": {
+        "type": "object",
+        "title": "create_transferArguments",
+        "properties": {
+          "transfer_id": {"type": "string", "title": "Transfer Id"},
+          "customer_ack_token": {"type": "string", "title": "Customer Ack Token"}
+        },
+        "required": ["transfer_id", "customer_ack_token"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "freeze_account",
+      "description": "Freeze an account (gated on admin_mode by ACS, not here).",
+      "parameters": {
+        "type": "object",
+        "title": "freeze_accountArguments",
+        "properties": {
+          "account_id": {"type": "string", "title": "Account Id"},
+          "reason": {"type": "string", "title": "Reason"}
+        },
+        "required": ["account_id", "reason"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "enable_admin_mode",
+      "description": "Enable elevated admin mode (ACS denies user-initiated calls).",
+      "parameters": {
+        "type": "object",
+        "title": "enable_admin_modeArguments",
+        "properties": {"reason": {"type": "string", "title": "Reason"}},
+        "required": ["reason"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_loan",
+      "description": "Read a home/auto loan with typed risk signals.\n\nSignals: ltv, dti, delinquency_status, modification_flag,\nofficer_authority_tier, and normalized risk_tier. (NEW DOMAIN —\nsensitive loans use the LN- prefix the original text gate can't match.)\n",
+      "parameters": {
+        "type": "object",
+        "title": "read_loanArguments",
+        "properties": {"loan_id": {"type": "string", "title": "Loan Id"}},
+        "required": ["loan_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "prepare_loan_modification",
+      "description": "Prepare a loan modification (not execute). Returns required authority tier.\n\nA modification on a sensitive loan (executive/senior authority,\ndelinquency, jumbo) is a high-risk action ACS should gate via the\ntyped officer_authority_tier / risk_tier — never via a hardcoded ID.\n",
+      "parameters": {
+        "type": "object",
+        "title": "prepare_loan_modificationArguments",
+        "properties": {
+          "loan_id": {"type": "string", "title": "Loan Id"},
+          "new_rate": {"type": "number", "title": "New Rate", "default": 0},
+          "forbearance_months": {"type": "integer", "title": "Forbearance Months", "default": 0}
+        },
+        "required": ["loan_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_portfolio",
+      "description": "Read a brokerage portfolio with typed risk signals.\n\nSignals: margin_level, position_concentration, pdt_flag,\nrestricted_security, suitability_tier, and normalized risk_tier.\n(NEW DOMAIN — sensitive portfolios use the BR- prefix.)\n",
+      "parameters": {
+        "type": "object",
+        "title": "read_portfolioArguments",
+        "properties": {"portfolio_id": {"type": "string", "title": "Portfolio Id"}},
+        "required": ["portfolio_id"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "place_trade",
+      "description": "Place a brokerage trade (not settled). Returns typed suitability/margin signals.\n\nA trade in a restricted security, on margin near a call, or\nexceeding suitability is high-risk — gate via the typed signals,\nnot via the portfolio ID.\n",
+      "parameters": {
+        "type": "object",
+        "title": "place_tradeArguments",
+        "properties": {
+          "portfolio_id": {"type": "string", "title": "Portfolio Id"},
+          "symbol": {"type": "string", "title": "Symbol"},
+          "side": {"type": "string", "title": "Side"},
+          "quantity": {"type": "number", "title": "Quantity"}
+        },
+        "required": ["portfolio_id", "symbol", "side", "quantity"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "knowledge_base_retrieve",
+      "description": "Retrieve grounded answers from the bank policy/product knowledge base.\n\nUse this for policy and product questions (approval limits, LTV caps,\nmargin-call policy, restricted-securities rules, KYC/AML procedure,\nfees, disputes). Returns a synthesized answer plus `citations`\n(ref_id + source + snippet) and a `grounded` boolean. If `grounded`\nis false, the corpus does not cover the question — do not fabricate a\npolicy answer; route to verified bank operations.\n",
+      "parameters": {
+        "type": "object",
+        "title": "knowledge_base_retrieveArguments",
+        "properties": {"query": {"type": "string", "title": "Query"}},
+        "required": ["query"]
+      }
+    }
+  }
+]

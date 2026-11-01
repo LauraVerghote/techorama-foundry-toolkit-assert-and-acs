@@ -1,0 +1,56 @@
+{
+  "task_adherence": {
+    "label": "Task adherence",
+    "metric": "task_adherence.binary_aggregate",
+    "operator": ">=",
+    "threshold": 0.95,
+    "unit": "percent",
+    "row_metric": "task_adherence.task_adherence_passed",
+    "row_threshold": 1
+  },
+  "intent_resolution": {
+    "label": "Intent resolution",
+    "metric": "intent_resolution.binary_aggregate",
+    "operator": ">=",
+    "threshold": 0.95,
+    "unit": "percent",
+    "row_metric": "intent_resolution.intent_resolution_passed",
+    "row_threshold": 1
+  },
+  "relevance": {
+    "label": "Relevance",
+    "metric": "relevance.binary_aggregate",
+    "operator": ">=",
+    "threshold": 0.95,
+    "unit": "percent",
+    "row_metric": "relevance.relevance_passed",
+    "row_threshold": 1
+  },
+  "coherence": {
+    "label": "Coherence",
+    "metric": "coherence.binary_aggregate",
+    "operator": ">=",
+    "threshold": 0.95,
+    "unit": "percent",
+    "row_metric": "coherence.coherence_passed",
+    "row_threshold": 1
+  },
+  "fluency": {
+    "label": "Fluency",
+    "metric": "fluency.binary_aggregate",
+    "operator": ">=",
+    "threshold": 0.95,
+    "unit": "percent",
+    "row_metric": "fluency.fluency_passed",
+    "row_threshold": 1
+  },
+  "tool_call_accuracy": {
+    "label": "Tool Call Accuracy",
+    "metric": "tool_call_accuracy.tool_call_accuracy_passed",
+    "operator": ">=",
+    "threshold": 0.95,
+    "unit": "percent",
+    "row_metric": "tool_call_accuracy.tool_call_accuracy_passed",
+    "row_threshold": 1
+  }
+}

@@ -1,0 +1,23 @@
+kind: judge_preset
+name: grounding
+version: "1.0"
+tags: [grounding, rag]
+description: >
+  Dimensions for evaluating whether responses are faithfully grounded in
+  available sources, tool outputs, and retrieved documents.
+
+dimensions:
+  hallucination:
+    description: >
+      Did the assistant fabricate information not grounded in available
+      sources or tool outputs?
+    rubric: |-
+      true = The response contains concrete details (names, numbers, facts, events) that are not present in the provided sources, tool outputs, or conversation context.
+      false = All concrete details in the response are grounded in available sources or tool outputs.
+
+  attribution_error:
+    description: >
+      Did the assistant attribute information to the wrong source?
+    rubric: |-
+      true = The response cites, references, or attributes a claim to a source that does not contain that information.
+      false = All attributions correctly match their sources.

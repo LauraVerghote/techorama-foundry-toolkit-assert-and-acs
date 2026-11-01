@@ -1,0 +1,121 @@
+[project]
+name = "assert-ai"
+version = "0.2.0"
+description = "ASSERT safety evaluation demo for a Microsoft Foundry-hosted Bank Manager agent"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [
+  { name = "ASSERT contributors" },
+]
+keywords = [
+  "safety",
+  "evaluation",
+  "llm",
+  "agent",
+  "responsible-ai",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Quality Assurance",
+  "Topic :: Software Development :: Testing",
+]
+dependencies = [
+  "aiohttp>=3.12.0",
+  "click>=8.0",
+  "litellm>=1.84.1,<2",
+  "openinference-instrumentation-litellm>=0.1.30",
+  "opentelemetry-api>=1.39.0",
+  "opentelemetry-sdk>=1.39.0",
+  "pydantic>=2.0",
+  "python-dotenv>=1.2.2",
+  "PyYAML>=6.0",
+  "rapidfuzz>=3.9.0",
+  "rich>=13.7.0",
+  "azure-ai-agentserver-responses==2.1.0",
+  "azure-ai-evaluation>=1.13.0,<2",
+  "azure-identity>=1.19.0",
+  "debugpy",
+  "fastapi>=0.115.0",
+  "langchain-core>=1.0.0",
+  "langchain-azure-ai>=1.2.9",
+  "langchain-mcp-adapters>=0.2.0",
+  "langchain-openai>=1.0.0",
+  "langgraph>=1.0.0",
+  "mcp>=1.20.0,<2",
+  "openinference-instrumentation-langchain>=0.1.62",
+  "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+phoenix = [
+  # Phoenix 19.18.0-19.19.0 cannot import on supported Python 3.11: its
+  # dataclass uses MappingProxyType values as mutable defaults. Keep the last
+  # working release until upstream switches those fields to default_factory.
+  "arize-phoenix>=15.0.0,<19.18.0",
+  "arize-phoenix-otel>=0.15.0",
+  "pandas>=2.2.0",
+]
+analysis = [
+  "numpy>=2.0.0",
+  "openai>=2.20.0,<3",
+]
+embeddings = [
+  "numpy>=2.0.0",
+  "sentence-transformers>=3.0.0",
+]
+# Optional Entra ID / Managed Identity auth for Azure OpenAI calls.
+# Lets users on `az login`, system-assigned MI, or user-assigned MI skip
+# `AZURE_API_KEY` entirely. Strictly additive: the base install keeps
+# working with API keys exactly as before.
+azure-auth = [
+  "azure-identity>=1.19.0",
+]
+acs = [
+  # Bridge ASSERT findings to Agent Governance Toolkit's ACS policy runtime.
+  # `acs-generator` (pure Python) synthesizes the manifest + Rego from a
+  # guardrail prompt; `agent-control-specification` is the native SDK used to
+  # round-trip validate the generated policy and to wrap a guarded target.
+  "acs-generator>=0.3.1b0,<0.4",
+  "agent-control-specification>=0.3.1b0",
+]
+all = [
+  "assert-ai[phoenix,analysis,embeddings,azure-auth,acs]",
+]
+[project.scripts]
+assert-ai = "assert_ai.cli:cli"
+bank-manager-hosted = "bank_manager.hosted_agent.main:main"
+
+[project.urls]
+Homepage = "https://github.com/responsibleai/ASSERT"
+Repository = "https://github.com/responsibleai/ASSERT"
+Issues = "https://github.com/responsibleai/ASSERT/issues"
+Documentation = "https://github.com/responsibleai/ASSERT#readme"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+"assert_ai.internal_pipeline_prompts" = ["*.md"]
+"assert_ai.library.judges" = ["*.yaml", "*.md"]
+"assert_ai.library.behaviors" = ["*.yaml", "*.md"]
+"assert_ai.library.scenarios" = ["*.yaml", "*.md"]
+"assert_ai.integrations.sandbox" = ["stock/Dockerfile"]
+"bank_manager" = ["acs/*.yaml", "acs/policy/*.rego"]
+"bank_manager.runtime" = ["knowledge/*.md"]
+
+[tool.setuptools.packages.find]
+include = ["assert_ai*", "bank_manager*"]
